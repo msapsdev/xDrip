@@ -3,23 +3,21 @@ package com.eveningoutpost.dexdrip.UtilityModels;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
-import android.content.Intent;
-import android.os.Bundle;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.EditText;
 
-import com.eveningoutpost.dexdrip.Home;
-import com.eveningoutpost.dexdrip.NFCReaderX;
 import com.eveningoutpost.dexdrip.ImportedLibraries.usbserial.util.HexDump;
 import com.eveningoutpost.dexdrip.Models.ActiveBluetoothDevice;
 import com.eveningoutpost.dexdrip.Models.BgReading;
 import com.eveningoutpost.dexdrip.Models.JoH;
 import com.eveningoutpost.dexdrip.Models.LibreBlock;
 import com.eveningoutpost.dexdrip.Models.Sensor;
+import com.eveningoutpost.dexdrip.Models.SensorSanity;
 import com.eveningoutpost.dexdrip.Models.TransmitterData;
 import com.eveningoutpost.dexdrip.Models.UserError;
 import com.eveningoutpost.dexdrip.Models.UserError.Log;
+import com.eveningoutpost.dexdrip.NFCReaderX;
 import com.eveningoutpost.dexdrip.R;
 import com.eveningoutpost.dexdrip.Services.DexCollectionService;
 import com.eveningoutpost.dexdrip.utils.CheckBridgeBattery;
@@ -56,8 +54,6 @@ public class Blukon {
     private static boolean m_getNowGlucoseDataIndexCommand = false;
     private static final int GET_SENSOR_AGE_DELAY = 3 * 3600;
     private static final String BLUKON_GETSENSORAGE_TIMER = "blukon-getSensorAge-timer";
-    private static final String BLUKON_DECODE_SERIAL_TIMER = "blukon-decodeSerial-timer";
-    private static final int GET_DECODE_SERIAL_DELAY = 12 * 3600;
     private static boolean m_getNowGlucoseDataCommand = false;// to be sure we wait for a GlucoseData Block and not using another block
     private static long m_timeLastBg = 0;
     private static long m_persistentTimeLastBg;
@@ -82,7 +78,8 @@ public class Blukon {
         // then we will never get reset due to missed reading service restarts
         long m_minutesDiff = 0;
 
-        m_minutesDiff = (long) ((((JoH.tsl() - m_timeLastCmdReceived) / 1000) + 30) / 60);
+        m_minutesDiff = (long) (JoH.msSince(m_timeLastCmdReceived) / Constants.MINUTE_IN_MS);
+
         Log.i(TAG, "m_minutesDiff to last cmd=" + m_minutesDiff + ", last cmd received at: " + JoH.dateTimeText(m_timeLastCmdReceived));
 
         if (m_communicationStarted) {
@@ -101,9 +98,7 @@ public class Blukon {
     }
 
     public static void initialize() {
-            Log.i(TAG, "initialize!");
-            Pref.setInt("bridge_battery", 0); //force battery to no-value before first reading
-            Pref.setInt("nfc_sensor_age", 0); //force sensor age to no-value before first reading
+            Log.i(TAG, "initialize Blukon!");
             JoH.clearRatelimit(BLUKON_GETSENSORAGE_TIMER);
             m_getNowGlucoseDataCommand = false;
             m_getNowGlucoseDataIndexCommand = false;
@@ -236,7 +231,8 @@ private static final int POSITION_OF_SENSOR_STATUS_BYTE = 17;
 
         // calculate time delta to last valid BG reading
         m_persistentTimeLastBg = PersistentStore.getLong("blukon-time-of-last-reading");
-        m_minutesDiffToLastReading = (int) ((((JoH.tsl() - m_persistentTimeLastBg) / 1000) + 30) / 60);
+        m_minutesDiffToLastReading = (int) (((JoH.msSince(m_persistentTimeLastBg) / 1000) + 30) / 60);
+
         Log.i(TAG, "m_minutesDiffToLastReading=" + m_minutesDiffToLastReading + ", last reading: " + JoH.dateTimeText(m_persistentTimeLastBg));
 
         // Get history if the last reading is older than we can reasonably backfill
@@ -257,19 +253,9 @@ private static final int POSITION_OF_SENSOR_STATUS_BYTE = 17;
          */
         if (strRecCmd.equalsIgnoreCase(WAKEUP_COMMAND)) {
             cmdFound = 1;
-
-            m_minutesDiffToLastReading = (int) ((((JoH.tsl() - m_persistentTimeLastBg) / 1000)) / 60);
-            Log.i(TAG, "m_minutesDiffToLastReading (no rounding)=" + m_minutesDiffToLastReading + ", last reading: " + JoH.dateTimeText(m_persistentTimeLastBg));
-
-            if (m_minutesDiffToLastReading >= 4) {
-                Log.i(TAG, "Reset currentCommand");
-                currentCommand = "";
-                m_communicationStarted = true;
-            } else {
-                Log.e(TAG, "New Cmd received too early, send blukon to sleep");
-                currentCommand = SLEEP_COMMAND;
-                //Home.toaststaticnext("New Cmd received too early: ignore it!");
-            }
+            Log.i(TAG, "Reset currentCommand");
+            currentCommand = "";
+            m_communicationStarted = true;
         }
 
         // BluconACKResponse will come in two different situations
@@ -357,8 +343,17 @@ private static final int POSITION_OF_SENSOR_STATUS_BYTE = 17;
                 Remark: Byte #17 (0 indexing) contains the SensorStatusByte.
             */
 
-            if (JoH.pratelimit(BLUKON_DECODE_SERIAL_TIMER, GET_DECODE_SERIAL_DELAY)) {
-                String SensorSn = LibreUtils.decodeSerialNumber(buffer);
+            if (!LibreUtils.validatePatchInfo(buffer)) {
+                Log.e(TAG, "Patch info doesn't look valid - read error? " + JoH.bytesToHex(buffer));
+            } else {
+
+                final String SensorSn = LibreUtils.decodeSerialNumber(buffer);
+
+                if (SensorSanity.checkLibreSensorChangeIfEnabled(SensorSn)) {
+                    Log.e(TAG, "Problem with Libre Serial Number - not processing");
+                    return null;
+                }
+
                 // TODO: Only write this after checksum was verified
                 PersistentStore.setString("LibreSN", SensorSn);
             }
@@ -404,15 +399,23 @@ private static final int POSITION_OF_SENSOR_STATUS_BYTE = 17;
                 gotLowBat = true;
             }
 
-            if (JoH.pratelimit(BLUKON_GETSENSORAGE_TIMER, GET_SENSOR_AGE_DELAY)) {
-                currentCommand = GET_SENSOR_TIME_COMMAND;
-                Log.i(TAG, "getSensorAge");
+            /* LibreAlarmReceiver.CalculateFromDataTransferObject, called when processing historical data,
+             * expects the sensor age not to be updated yet, so only update the sensor age when not retrieving history.
+             */
+            if (Pref.getBooleanDefaultFalse("external_blukon_algorithm") || getHistoricReadings) {
+                // Send the command to getHistoricData (read all blocks from 0 to 0x2b)
+                Log.i(TAG, "getHistoricData (2)");
+                currentCommand = GET_HISTORIC_DATA_COMMAND_ALL_BLOCKS;
+                m_blockNumber = 0;
+
+                //force read from sensor age when getting historic on next reading
+                if (getHistoricReadings) {
+                    JoH.clearRatelimit(BLUKON_GETSENSORAGE_TIMER);
+                }
             } else {
-                if (Pref.getBooleanDefaultFalse("external_blukon_algorithm") || getHistoricReadings) {
-                    // Send the command to getHistoricData (read all blcoks from 0 to 0x2b)
-                    Log.i(TAG, "getHistoricData (2)");
-                    currentCommand = GET_HISTORIC_DATA_COMMAND_ALL_BLOCKS;
-                    m_blockNumber = 0;
+                if (JoH.pratelimit(BLUKON_GETSENSORAGE_TIMER, GET_SENSOR_AGE_DELAY)) {
+                    currentCommand = GET_SENSOR_TIME_COMMAND;
+                    Log.i(TAG, "getSensorAge");
                 } else {
                     currentCommand = GET_NOW_DATA_INDEX_COMMAND;
                     m_getNowGlucoseDataIndexCommand = true;//to avoid issue when gotNowDataIndex cmd could be same as getNowGlucoseData (case block=3)
@@ -425,26 +428,33 @@ private static final int POSITION_OF_SENSOR_STATUS_BYTE = 17;
          */
         } else if (currentCommand.startsWith(GET_SENSOR_TIME_COMMAND) /*getSensorAge*/ && strRecCmd.startsWith(SINGLE_BLOCK_INFO_RESPONSE_PREFIX)) {
             cmdFound = 1;
-            Log.i(TAG, "SensorAge received");
 
             int sensorAge = sensorAge(buffer);
+            Log.d(TAG, "SensorAge received=" + sensorAge);
 
-            if (Pref.getBooleanDefaultFalse("external_blukon_algorithm") || getHistoricReadings) {
-                // Send the command to getHistoricData (read all blcoks from 0 to 0x2b)
-                Log.i(TAG, "getHistoricData (3)");
-                currentCommand = GET_HISTORIC_DATA_COMMAND_ALL_BLOCKS;
-                m_blockNumber = 0;
-            } else {
-                /* LibreAlarmReceiver.CalculateFromDataTransferObject, called when processing historical data,
-                 * expects the sensor age not to be updated yet, so only update the sensor age when not retrieving history.
-                 */
-                if ((sensorAge > 0) && (sensorAge < 200000)) {
-                    Pref.setInt("nfc_sensor_age", sensorAge);//in min
-                }
-                currentCommand = GET_NOW_DATA_INDEX_COMMAND;
-                m_getNowGlucoseDataIndexCommand = true;//to avoid issue when gotNowDataIndex cmd could be same as getNowGlucoseData (case block=3)
-                Log.i(TAG, "getNowGlucoseDataIndexCommand");
+            int currentSensorAge = Pref.getInt("nfc_sensor_age", 0);
+            Log.d(TAG, "current SensorAge=" + currentSensorAge);
+
+            //This is a new sensor, force read from serial
+            if (sensorAge < currentSensorAge) {
+                Log.i(TAG, "new sensor?");
             }
+
+            if ((sensorAge >= 0) && (sensorAge < 200000)) {
+                Pref.setInt("nfc_sensor_age", sensorAge);//in min
+                //when getting historic, we use LibreAlarm Code and sensor age is not exactly same as calculated here
+                //to avoid warning, simply overide this flag
+                Pref.setBoolean("nfc_age_problem", false);
+            } else {
+                Log.e(TAG, "Do not set 'nfc_sensor_age'");
+            }
+
+            currentSensorAge = Pref.getInt("nfc_sensor_age", 0);
+            Log.d(TAG, "[After set] current SensorAge=" + currentSensorAge);
+
+            currentCommand = GET_NOW_DATA_INDEX_COMMAND;
+            m_getNowGlucoseDataIndexCommand = true;//to avoid issue when gotNowDataIndex cmd could be same as getNowGlucoseData (case block=3)
+            Log.i(TAG, "getNowGlucoseDataIndexCommand");
 
         /*
          * step 8: determine trend or historic data index
@@ -511,12 +521,20 @@ private static final int POSITION_OF_SENSOR_STATUS_BYTE = 17;
             Log.i(TAG, "********got getNowGlucoseData=" + currentGlucose);
 
             if (!m_getOlderReading) {
-                processNewTransmitterData(TransmitterData.create(currentGlucose, currentGlucose, 0 /*battery level force to 0 as unknown*/, now));
 
-                m_timeLastBg = now;
+                m_minutesDiffToLastReading = (int) (JoH.msSince(m_persistentTimeLastBg) / Constants.MINUTE_IN_MS);
+                Log.i(TAG, "m_minutesDiffToLastReading (no rounding)=" + m_minutesDiffToLastReading + ", last reading: " + JoH.dateTimeText(m_persistentTimeLastBg));
 
-                PersistentStore.setLong("blukon-time-of-last-reading", m_timeLastBg);
-                Log.i(TAG, "time of current reading: " + JoH.dateTimeText(m_timeLastBg));
+                if (m_minutesDiffToLastReading >= 4) {
+                    processNewTransmitterData(TransmitterData.create(currentGlucose, currentGlucose, 0 /*battery level force to 0 as unknown*/, now));
+
+                    m_timeLastBg = now;
+
+                    PersistentStore.setLong("blukon-time-of-last-reading", m_timeLastBg);
+                    Log.i(TAG, "time of current reading: " + JoH.dateTimeText(m_timeLastBg));
+                } else {
+                    Log.e(TAG, "New Cmd received too early, send blukon to sleep and ignore BG value");
+                }
 
                 /* 
                  * step 10: send sleep command
@@ -524,7 +542,6 @@ private static final int POSITION_OF_SENSOR_STATUS_BYTE = 17;
                 currentCommand = SLEEP_COMMAND;
                 Log.i(TAG, "Send sleep cmd");
                 m_communicationStarted = false;
-
                 m_getNowGlucoseDataCommand = false;
             } else {
                 Log.i(TAG, "bf: processNewTransmitterData with delayed timestamp of " + m_minutesBack + " min");

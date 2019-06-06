@@ -1,7 +1,6 @@
 package com.eveningoutpost.dexdrip.Models;
 
 import android.content.Context;
-import android.content.Intent;
 import android.content.SharedPreferences;
 import android.preference.PreferenceManager;
 import android.provider.BaseColumns;
@@ -13,7 +12,6 @@ import com.activeandroid.Model;
 import com.activeandroid.annotation.Column;
 import com.activeandroid.annotation.Table;
 import com.activeandroid.query.Select;
-import com.eveningoutpost.dexdrip.G5Model.Ob1G5StateMachine;
 import com.eveningoutpost.dexdrip.GcmActivity;
 import com.eveningoutpost.dexdrip.Home;
 import com.eveningoutpost.dexdrip.ImportedLibraries.dexcom.records.CalRecord;
@@ -26,6 +24,7 @@ import com.eveningoutpost.dexdrip.UtilityModels.CollectionServiceStarter;
 import com.eveningoutpost.dexdrip.UtilityModels.Constants;
 import com.eveningoutpost.dexdrip.UtilityModels.Notifications;
 import com.eveningoutpost.dexdrip.UtilityModels.Pref;
+import com.eveningoutpost.dexdrip.calibrations.CalibrationAbstract;
 import com.eveningoutpost.dexdrip.calibrations.NativeCalibrationPipe;
 import com.eveningoutpost.dexdrip.calibrations.PluggableCalibration;
 import com.eveningoutpost.dexdrip.utils.DexCollectionType;
@@ -272,15 +271,22 @@ public class Calibration extends Model {
         final Sensor sensor = Sensor.currentSensor();
         final List<BgReading> bgReadings = BgReading.latest_by_size(3);
 
-        // don't allow initial calibration if data would be stale
+        // don't allow initial calibration if data would be stale (but still use data for native mode)
             if ((bgReadings == null) || (bgReadings.size() != 3) || !isDataSuitableForDoubleCalibration() ){
-            UserError.Log.wtf(TAG, "Did not find 3 readings for initial calibration - aborting");
 
             if (Ob1G5CollectionService.usingNativeMode()) {
-                JoH.static_toast_long("Sending Blood Tests to G5 Native");
+                JoH.static_toast_long("Sending Blood Tests to Transmitter"); // TODO extract string
                 BloodTest.create(JoH.tsl() - (Constants.SECOND_IN_MS * 30), bg1, "Initial Calibration");
                 BloodTest.create(JoH.tsl(), bg2, "Initial Calibration");
+
+                if (!Pref.getBooleanDefaultFalse("bluetooth_meter_for_calibrations_auto")) {
+                    // blood tests above don't automatically become part of calibration pipe if this setting is unset so do here
+                    NativeCalibrationPipe.addCalibration((int) bg1, JoH.tsl() - (Constants.SECOND_IN_MS * 30));
+                    NativeCalibrationPipe.addCalibration((int) bg2, JoH.tsl());
+                }
+
             } else {
+                UserError.Log.wtf(TAG, "Did not find 3 readings for initial calibration - aborting");
                 JoH.static_toast_long("Not enough recent sensor data! - cancelling!");
             }
             return;
@@ -353,8 +359,6 @@ public class Calibration extends Model {
 
         JoH.clearCache();
 
-        //Ob1G5StateMachine.addCalibration((int) bg1, JoH.tsl() - (Constants.SECOND_IN_MS * 30));
-        //Ob1G5StateMachine.addCalibration((int) bg2, JoH.tsl());
 
         NativeCalibrationPipe.addCalibration((int) bg1, JoH.tsl() - (Constants.SECOND_IN_MS * 30));
         NativeCalibrationPipe.addCalibration((int) bg2, JoH.tsl());
@@ -747,6 +751,19 @@ public class Calibration extends Model {
                     Home.toaststaticnext("Got invalid zero slope calibration!");
                     calibration.save(); // Save nulled record, lastValid should protect from bad calibrations
                     newFingerStickData();
+                } else if (calibration.intercept > CalibrationAbstract.getHighestSaneIntercept()) {
+                 /*
+                    calibration.sensor_confidence = 0;
+                    calibration.slope_confidence = 0;
+                    final String msg = "Got invalid non-sane intercept calibration! ";
+                    Home.toaststaticnext(msg);
+                    UserError.Log.wtf(TAG, msg + calibration.toS());
+                */
+                    // Just log the error but store the calibration so we can use it in a plugin situation. lastValid() will filter it from calculations.
+                    UserError.Log.e(TAG, "Got invalid intercept value in xDrip classic algorithm: " + calibration.intercept);
+                    calibration.save(); // save record, lastValid should protect from bad calibrations
+                    newFingerStickData();
+
                 } else {
                     calibration.save();
                     newFingerStickData();
@@ -1085,6 +1102,7 @@ public class Calibration extends Model {
                 .where("slope_confidence != 0")
                 .where("sensor_confidence != 0")
                 .where("slope != 0")
+                .where("intercept <= ?", CalibrationAbstract.getHighestSaneIntercept())
                 .orderBy("timestamp desc")
                 .executeSingle();
     }
@@ -1147,6 +1165,8 @@ public class Calibration extends Model {
                 .execute();
     }
 
+    // TODO calls to this method are used for UI features as to whether calibration is needed
+    // TODO this might need to updated to ignore invalid intercepts depending on plugin configuration etc
     public static List<Calibration> latestValid(int number) {
         return latestValid(number, JoH.tsl() + Constants.HOUR_IN_MS);
     }
@@ -1156,6 +1176,7 @@ public class Calibration extends Model {
         if (sensor == null) {
             return null;
         }
+        // we don't filter invalid intercepts here as they will be filtered in the plugin itself
         return new Select()
                 .from(Calibration.class)
                 .where("Sensor = ? ", sensor.getId())

@@ -1,6 +1,7 @@
 package com.eveningoutpost.dexdrip.UtilityModels;
 
 import com.eveningoutpost.dexdrip.Home;
+import com.eveningoutpost.dexdrip.Models.SensorSanity;
 
 import android.util.Log;
 
@@ -111,7 +112,7 @@ public class LibreUtils {
         
         
         
-        if (allowTestingWithDeadSensor()) {
+        if (SensorSanity.allowTestingWithDeadSensor()) {
             Log.e(TAG, "Warning allow to use a dead sensor");
             return true;
         }
@@ -122,11 +123,12 @@ public class LibreUtils {
     
         return ret;
     }
-    
-    public static boolean allowTestingWithDeadSensor() {
-        return Pref.getBooleanDefaultFalse("engineering_mode") && 
-               Pref.getBooleanDefaultFalse("allow_testing_with_dead_sensor");
+
+    // check manufacturer bytes look valid
+    public static boolean validatePatchInfo(final byte[] buffer) {
+        return buffer.length >= 11 && buffer[9] == (byte) 0x07 && buffer[10] == (byte) 0xE0;
     }
+
     
     // This is the function that all should read (only the correct 8 bytes)
     // Since I don't have a blukon to test, not changing decodeSerialNumber
@@ -135,11 +137,11 @@ public class LibreUtils {
         System.arraycopy(input,0, serialBuffer, 3, 8);
         return decodeSerialNumber( serialBuffer);
     }
-    
-    
+
+
     // This function assumes that the UID is starting at place 3, and is 8 bytes long
     public static String decodeSerialNumber(byte[] input) {
-        
+
         String lookupTable[] =
                 {
                         "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
